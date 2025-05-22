@@ -157,6 +157,15 @@ Function FuckFix {
 	{
 		return $newcommand
 	}
+
+	# If no pattern matched, try LLM
+	if ($newcommand -eq $lastcommand) {
+		Write-Verbose "No predefined pattern matched. Trying LLM..."
+		$llmSuggestion = Invoke-TheFuckWithLLM -LastCommand $lastcommand -PreviousError $preverror
+		if ($llmSuggestion) {
+			$newcommand = $llmSuggestion
+		}
+	}
 	
 	## TODO SEPARATE COMMAND AND ARGUMENT FIXES
 	#Fix PING -a (-a param must be BEFORE the Host/IP or it is ignored, so move it before the Host/IP if it's not)
@@ -359,10 +368,15 @@ Function Fixgit {
 )
 	Write-Verbose "Git command to fix: $lastcommand"
 	Invoke-Expression "$lastcommand 2>&1" -ErrorVariable gitres | Out-Null
-	$origcmd = ([string]$gitres[0]).split('')[1].Replace("'",'')
-	$correctedcmd = ([string]($gitres[1])).split('')[7]
-	
-	return $lastcommand -replace $origcmd,$correctedcmd
+	Write-Verbose "gitres[0]: $($gitres[0])"
+    Write-Verbose "gitres[1]: $($gitres[1])"
+    if ($gitres[0] -and $gitres[1]) {
+        $origcmd = ([string]$gitres[0]).split('')[1].Replace("'",'')
+        $correctedcmd = ([string]($gitres[1])).split('')[7]
+        return $lastcommand -replace $origcmd,$correctedcmd
+    } else {
+        return $lastcommand
+    }
 }
 
 Function IsExtParameterFucked {
@@ -376,6 +390,150 @@ Function IsExtParameterFucked {
 	}
 	
 	return $false
+}
+
+# Function to call Azure OpenAI
+function Invoke-TheFuckWithLLM {
+[CmdletBinding()]
+param(
+    [string]$LastCommand,
+    [string]$PreviousError
+)
+
+$aoaiEndpoint = $env:POSHFUCK_AOAI_ENDPOINT
+$aoaiDeploymentName = $env:POSHFUCK_AOAI_DEPLOYMENT_NAME
+
+if (-not $aoaiEndpoint -or -not $aoaiDeploymentName) {
+    Write-Verbose "Azure OpenAI endpoint or deployment name not configured. Skipping LLM."
+    return $null
+}
+
+$headers = @{}
+$accessToken = $null
+
+# Attempt to get AAD token using Az.Accounts module (Azure PowerShell)
+if (Get-Module -ListAvailable -Name Az.Accounts) {
+    try {
+        Write-Verbose "Attempting to acquire AAD token for Azure OpenAI via Azure PowerShell..."
+        $tokenResponse = Get-AzAccessToken -ResourceUrl "https://cognitiveservices.azure.com" -ErrorAction Stop
+        $accessToken = $tokenResponse.Token
+        Write-Verbose "Successfully acquired AAD token via Azure PowerShell."
+    } catch {
+        Write-Warning "Failed to acquire AAD token using Get-AzAccessToken: $($_.Exception.Message)"
+        Write-Warning "Ensure you are logged in via Connect-AzAccount and have appropriate permissions."
+        # Don't return yet, will try Azure CLI next
+        $accessToken = $null 
+    }
+} else {
+    Write-Verbose "Az.Accounts module (Azure PowerShell) is not available. Will try Azure CLI."
+}
+
+# If Azure PowerShell failed or was not available, try Azure CLI
+if (-not $accessToken) {
+    Write-Verbose "Attempting to acquire AAD token for Azure OpenAI via Azure CLI..."
+    $azCliPath = Get-Command az -ErrorAction SilentlyContinue
+    if ($azCliPath) {
+        try {
+            $tokenFromAzCli = az account get-access-token --resource "https://cognitiveservices.azure.com" --query "accessToken" --output tsv 2>$null # Suppress stderr from az cli on success
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($tokenFromAzCli)) {
+                $accessToken = $tokenFromAzCli
+                Write-Verbose "Successfully acquired AAD token via Azure CLI."
+            } else {
+                Write-Warning "Azure CLI command \'az account get-access-token\' failed or returned no token. Exit code: $LASTEXITCODE"
+                $azErrorOutput = az account get-access-token --resource "https://cognitiveservices.azure.com" --query "accessToken" --output tsv 2>&1 # Capture stderr for logging
+                if ($azErrorOutput -ne $tokenFromAzCli) { # if there was actual error output
+                    Write-Warning "Azure CLI error output: $azErrorOutput"
+                }
+                Write-Warning "Ensure you are logged in via \'az login\' and have appropriate permissions."
+                $accessToken = $null
+            }
+        } catch {
+            Write-Warning "Failed to execute Azure CLI command: $($_.Exception.Message)"
+            $accessToken = $null
+        }
+    } else {
+        Write-Warning "Azure CLI (\'az\') command not found. Cannot acquire AAD token."
+    }
+}
+
+# If token was acquired (either by Az PowerShell or Az CLI), set headers
+if ($accessToken) {
+    $headers.Authorization = "Bearer $accessToken"
+} else {
+    Write-Warning "Failed to acquire AAD token using both Azure PowerShell and Azure CLI. Cannot call Azure OpenAI."
+    return $null # Stop if no token could be acquired
+}
+
+$systemMessage = "You are an AI assistant that helps fix command line errors. It could be because of an error in command itself or the parameters. Suggest a corrected command. Only provide the corrected command itself, with no explanation or markdown. If you cannot determine a correction, respond with `"NO_SUGGESTION`"."
+$userMessage = @"
+The user executed the following command:
+$LastCommand
+
+It resulted in the following error (if any):
+$PreviousError
+"@
+
+$messages = @(
+    @{
+        role = "system"
+		content = $systemMessage
+    },
+    @{
+        role = "user"
+        content = $userMessage
+    }
+)
+
+$body = @{
+    messages = $messages
+    max_tokens = 60
+    temperature = 0.2
+} | ConvertTo-Json
+
+$aoaiEndpoint = $aoaiEndpoint.TrimEnd('/')
+# Updated to chat completions endpoint
+$fullUrl = "$aoaiEndpoint/openai/deployments/$aoaiDeploymentName/chat/completions?api-version=2025-04-01-preview"
+
+try {
+    Write-Verbose "Calling Azure OpenAI (Chat Completions): $fullUrl"
+    Write-Verbose "Request body: $body" # Added for debugging
+    $response = Invoke-RestMethod -Uri $fullUrl -Method Post -Headers $headers -Body $body -ContentType "application/json" -ErrorAction Stop
+    
+    $suggestedCommand = $null
+    # Updated response parsing for Chat Completions
+    if ($response.choices -and $response.choices.Count -gt 0 -and $response.choices[0].message) {
+        $suggestedCommand = $response.choices[0].message.content.Trim()
+    }
+
+    if ($suggestedCommand -and $suggestedCommand -ne "NO_SUGGESTION" -and $suggestedCommand -ne $LastCommand) {
+        Write-Verbose "LLM Suggestion: $suggestedCommand"
+        return $suggestedCommand
+    } else {
+        Write-Verbose "LLM could not provide a new suggestion, suggestion was 'NO_SUGGESTION', or suggestion was same as original."
+        return $null
+    }
+} catch {
+    Write-Warning "Error calling Azure OpenAI: $($_.Exception.Message)"
+    if ($_.Exception.Response) {
+        $errorResponse = $_.Exception.Response | ConvertFrom-Json -ErrorAction SilentlyContinue
+        if ($errorResponse) {
+            Write-Warning "Azure OpenAI Error Details: $($errorResponse | ConvertTo-Json -Depth 3)"
+        } else {
+            $rawErrorResponse = try { 
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $responseText = $reader.ReadToEnd()
+                $reader.Dispose()
+                $stream.Dispose()
+                $responseText
+            } catch { 
+                "Failed to read raw error stream: $($_.Exception.Message)" 
+            }
+            Write-Warning "Azure OpenAI Raw Error Response: $rawErrorResponse"
+        }
+    }
+    return $null
+}
 }
 
 Export-ModuleMember *-*
